@@ -44,6 +44,8 @@ public class MainActivity extends Activity {
     private TextView blockedCountText;
     private TextView seenCountText;
     private TextView strictCountText;
+    private TextView strictBlockedCountText;
+    private TextView strictStatusText;
     private Switch bootSwitch;
     private final Handler handler = new Handler(Looper.getMainLooper());
 
@@ -128,6 +130,16 @@ public class MainActivity extends Activity {
         statsCard.addView(strictLabel);
         strictCountText = text("0", 24, Color.rgb(255,122,0), true);
         statsCard.addView(strictCountText);
+
+        TextView strictBlockedLabel = text("Bloqueos extra del modo estricto", 14, Color.rgb(176,176,176), false);
+        strictBlockedLabel.setPadding(0, dp(12), 0, 0);
+        statsCard.addView(strictBlockedLabel);
+        strictBlockedCountText = text("0", 24, Color.rgb(255,122,0), true);
+        statsCard.addView(strictBlockedCountText);
+
+        strictStatusText = text("Modo estricto: comprobando…", 13, Color.LTGRAY, true);
+        strictStatusText.setPadding(0, dp(12), 0, 0);
+        statsCard.addView(strictStatusText);
         root.addView(statsCard, matchWrap(dp(14)));
 
         Button strictApps = secondaryButton("🔥 Modo estricto por app");
@@ -173,7 +185,7 @@ public class MainActivity extends Activity {
         });
         root.addView(vpnSettings, matchWrap(dp(16)));
 
-        TextView note = text("El bloqueo normal permanece activo para todo el teléfono. En las apps del modo estricto, AddBlocker bloquea automáticamente dominios con patrones de publicidad, tracking o analítica mientras esa app está en primer plano. Para distinguir la app activa, Android requiere Acceso de uso.", 13, Color.rgb(176,176,176), false);
+        TextView note = text("El bloqueo normal permanece activo para todo el teléfono. En las apps del modo estricto, AddBlocker usa una lista más agresiva de redes publicitarias y dominios de video de anuncios. Para saber qué app está abierta, Android requiere Acceso de uso.", 13, Color.rgb(176,176,176), false);
         note.setLineSpacing(0, 1.2f);
         root.addView(note, matchWrap(dp(30)));
         return scroll;
@@ -247,6 +259,21 @@ public class MainActivity extends Activity {
         blockedCountText.setText(String.valueOf(prefs.getLong("blocked_count", 0)));
         seenCountText.setText(String.valueOf(prefs.getLong("seen_count", 0)));
         strictCountText.setText(String.valueOf(countLines(prefs.getString("strict_apps", ""))));
+        strictBlockedCountText.setText(String.valueOf(prefs.getLong("strict_blocked_count", 0)));
+
+        boolean usage = hasUsageAccess();
+        boolean strictActive = prefs.getBoolean("strict_mode_active", false);
+        String lastPackage = prefs.getString("last_foreground_package", "");
+        if (!usage) {
+            strictStatusText.setText("Modo estricto: FALTA Acceso de uso");
+            strictStatusText.setTextColor(Color.rgb(255, 100, 80));
+        } else if (strictActive) {
+            strictStatusText.setText("Modo estricto ACTIVO ahora" + (lastPackage.isEmpty() ? "" : " · " + lastPackage));
+            strictStatusText.setTextColor(Color.rgb(255,122,0));
+        } else {
+            strictStatusText.setText("Modo estricto listo" + (lastPackage.isEmpty() ? "" : " · última app: " + lastPackage));
+            strictStatusText.setTextColor(Color.LTGRAY);
+        }
     }
 
     private int countLines(String raw) {
@@ -279,7 +306,7 @@ public class MainActivity extends Activity {
         if (packages.isEmpty()) {
             new AlertDialog.Builder(this)
                     .setTitle(title)
-                    .setMessage("Android no devolvió ninguna aplicación para mostrar. Esta versión incluye la corrección de visibilidad; si acabas de actualizar, cierra y vuelve a abrir AddBlocker.")
+                    .setMessage("Android no devolvió ninguna aplicación para mostrar. Cierra y vuelve a abrir AddBlocker después de actualizar.")
                     .setPositiveButton("Cerrar", null)
                     .show();
             return;
