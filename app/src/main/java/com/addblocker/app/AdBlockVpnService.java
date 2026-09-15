@@ -32,17 +32,21 @@ public class AdBlockVpnService extends VpnService {
     private static final int NOTIFICATION_ID = 701;
     private static final String LOCAL_DNS = "10.7.0.2";
     private static final String VPN_ADDR = "10.7.0.1";
+    private static final int MAX_LOG_LINES = 300;
 
     private ParcelFileDescriptor tun;
     private Thread worker;
     private volatile boolean alive;
     private SharedPreferences prefs;
     private volatile Set<String> builtInDomains = Collections.emptySet();
+    private final Set<String> loggedThisSession = Collections.synchronizedSet(new HashSet<>());
+    private long logGeneration = -1;
 
     @Override public void onCreate() {
         super.onCreate();
         prefs = getSharedPreferences("addblocker", MODE_PRIVATE);
         builtInDomains = loadAssetDomains();
+        logGeneration = prefs.getLong("log_generation", 0);
         createNotificationChannel();
     }
 
@@ -125,8 +129,12 @@ public class AdBlockVpnService extends VpnService {
             String domain = parseQuestionName(packet, dnsOffset, dnsLen);
             if (domain == null || domain.isEmpty()) return null;
 
+            boolean blocked = shouldBlock(domain);
+            boolean suspicious = blocked || isSuspiciousDomain(domain);
+            recordDomain(domain, blocked, suspicious);
+
             byte[] dnsResponse;
-            if (shouldBlock(domain)) {
+            if (blocked) {
                 dnsResponse = buildNxDomain(packet, dnsOffset, dnsLen);
                 long total = prefs.getLong("blocked_count", 0) + 1;
                 prefs.edit().putLong("blocked_count", total).apply();
@@ -140,6 +148,46 @@ public class AdBlockVpnService extends VpnService {
         } catch (Exception e) {
             return null;
         }
+    }
+
+    private void recordDomain(String domain, boolean blocked, boolean suspicious) {
+        long currentGeneration = prefs.getLong("log_generation", 0);
+        if (currentGeneration != logGeneration) {
+            loggedThisSession.clear();
+            logGeneration = currentGeneration;
+        }
+        if (!loggedThisSession.add(domain)) return;
+
+        String flag = blocked ? "B" : (suspicious ? "S" : "N");
+        String line = System.currentTimeMillis() + "\t" + flag + "\t" + domain;
+        String old = prefs.getString("dns_log", "");
+        String combined = old == null || old.isEmpty() ? line : line + "\n" + old;
+        String[] lines = combined.split("\\n");
+        StringBuilder trimmed = new StringBuilder();
+        int limit = Math.min(lines.length, MAX_LOG_LINES);
+        for (int i = 0; i < limit; i++) {
+            if (i > 0) trimmed.append('\n');
+            trimmed.append(lines[i]);
+        }
+        long seen = prefs.getLong("seen_count", 0) + 1;
+        prefs.edit()
+                .putString("dns_log", trimmed.toString())
+                .putLong("seen_count", seen)
+                .apply();
+    }
+
+    private boolean isSuspiciousDomain(String domain) {
+        String d = domain.toLowerCase(Locale.US);
+        String[] tokens = {
+                "doubleclick", "googlesyndication", "googleadservices", "adservice", "admob",
+                "applovin", "unityads", "unity3dads", "ironsource", "is.com", "chartboost",
+                "vungle", "inmobi", "adcolony", "tapjoy", "fyber", "mopub", "pubmatic",
+                "rubiconproject", "amazon-adsystem", "adsystem", "adnxs", "criteo",
+                "scorecardresearch", "tracking", "tracker", "analytics", "adjust.com",
+                "appsflyer", "branch.io", "ads.", ".ads.", "-ads.", ".ad."
+        };
+        for (String token : tokens) if (d.contains(token)) return true;
+        return d.startsWith("ad.") || d.startsWith("ads.") || d.startsWith("adserver.");
     }
 
     private String parseQuestionName(byte[] data, int dnsOffset, int dnsLen) {
@@ -330,7 +378,7 @@ public class AdBlockVpnService extends VpnService {
                 : new Notification.Builder(this);
         return builder
                 .setContentTitle("Add Blocker activo")
-                .setContentText("Bloqueando anuncios y rastreadores mediante DNS local")
+                .setContentText("Bloqueando anuncios y registrando dominios DNS")
                 .setSmallIcon(android.R.drawable.ic_lock_lock)
                 .setContentIntent(pi)
                 .setOngoing(true)
