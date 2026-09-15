@@ -3,8 +3,11 @@ package com.addblocker.app;
 import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.AppOpsManager;
+import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.Color;
@@ -26,6 +29,15 @@ import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+
 public class MainActivity extends Activity {
     private static final int VPN_REQUEST = 1001;
     private SharedPreferences prefs;
@@ -33,6 +45,7 @@ public class MainActivity extends Activity {
     private TextView statusText;
     private TextView blockedCountText;
     private TextView seenCountText;
+    private TextView strictCountText;
     private Switch bootSwitch;
     private final Handler handler = new Handler(Looper.getMainLooper());
 
@@ -43,8 +56,7 @@ public class MainActivity extends Activity {
         }
     };
 
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
+    @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences("addblocker", MODE_PRIVATE);
         requestNotificationPermissionIfNeeded();
@@ -74,7 +86,7 @@ public class MainActivity extends Activity {
         scroll.addView(root, new ScrollView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         ImageView logo = new ImageView(this);
-        logo.setImageResource(com.addblocker.app.R.drawable.app_icon);
+        logo.setImageResource(R.drawable.app_icon);
         logo.setAdjustViewBounds(true);
         LinearLayout.LayoutParams logoLp = new LinearLayout.LayoutParams(dp(150), dp(150));
         logoLp.bottomMargin = dp(8);
@@ -103,16 +115,28 @@ public class MainActivity extends Activity {
         root.addView(protectionButton, btnLp);
 
         LinearLayout statsCard = card();
-        TextView statsLabel = text("Consultas bloqueadas", 14, Color.rgb(176,176,176), false);
+        statsCard.addView(text("Consultas bloqueadas", 14, Color.rgb(176,176,176), false));
         blockedCountText = text("0", 34, Color.rgb(255,122,0), true);
-        TextView seenLabel = text("Dominios detectados en el registro", 14, Color.rgb(176,176,176), false);
-        seenLabel.setPadding(0, dp(12), 0, 0);
-        seenCountText = text("0", 24, Color.WHITE, true);
-        statsCard.addView(statsLabel);
         statsCard.addView(blockedCountText);
+        TextView seenLabel = text("Dominios detectados", 14, Color.rgb(176,176,176), false);
+        seenLabel.setPadding(0, dp(12), 0, 0);
         statsCard.addView(seenLabel);
+        seenCountText = text("0", 24, Color.WHITE, true);
         statsCard.addView(seenCountText);
+        TextView strictLabel = text("Apps en modo estricto", 14, Color.rgb(176,176,176), false);
+        strictLabel.setPadding(0, dp(12), 0, 0);
+        statsCard.addView(strictLabel);
+        strictCountText = text("0", 24, Color.rgb(255,122,0), true);
+        statsCard.addView(strictCountText);
         root.addView(statsCard, matchWrap(dp(14)));
+
+        Button strictApps = secondaryButton("🔥 Modo estricto por app");
+        strictApps.setOnClickListener(v -> chooseStrictApps());
+        root.addView(strictApps, matchWrap(dp(10)));
+
+        Button usageAccess = secondaryButton("Permiso para detectar la app activa");
+        usageAccess.setOnClickListener(v -> openUsageAccess());
+        root.addView(usageAccess, matchWrap(dp(10)));
 
         Button detected = secondaryButton("Registro de anuncios detectados");
         detected.setOnClickListener(v -> showDetectedDomains());
@@ -131,7 +155,7 @@ public class MainActivity extends Activity {
         root.addView(allowList, matchWrap(dp(10)));
 
         Button excludedApps = secondaryButton("Apps excluidas del bloqueo");
-        excludedApps.setOnClickListener(v -> chooseExcludedApps());
+        excludedApps.setOnClickListener(v -> chooseAppList("excluded_apps", "Apps excluidas", "Estas apps no pasarán por AddBlocker."));
         root.addView(excludedApps, matchWrap(dp(10)));
 
         bootSwitch = new Switch(this);
@@ -149,10 +173,9 @@ public class MainActivity extends Activity {
         });
         root.addView(vpnSettings, matchWrap(dp(16)));
 
-        TextView note = text("El filtrado se hace en el teléfono. El registro muestra consultas DNS recientes y marca como posibles anuncios los dominios que coinciden con patrones de redes publicitarias. La marca es orientativa: puedes revisar cada dominio antes de bloquearlo.", 13, Color.rgb(176,176,176), false);
+        TextView note = text("El bloqueo normal permanece activo para todo el teléfono. En las apps del modo estricto, AddBlocker bloquea automáticamente dominios con patrones de publicidad, tracking o analítica mientras esa app está en primer plano. Para distinguir la app activa, Android requiere Acceso de uso.", 13, Color.rgb(176,176,176), false);
         note.setLineSpacing(0, 1.2f);
         root.addView(note, matchWrap(dp(30)));
-
         return scroll;
     }
 
@@ -189,16 +212,12 @@ public class MainActivity extends Activity {
         return lp;
     }
 
-    private int dp(int value) {
-        return Math.round(value * getResources().getDisplayMetrics().density);
-    }
+    private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }
 
     private void toggleProtection() {
         boolean running = prefs.getBoolean("running", false);
-        if (running) {
-            Intent stop = new Intent(this, AdBlockVpnService.class).setAction(AdBlockVpnService.ACTION_STOP);
-            startService(stop);
-        } else {
+        if (running) startService(new Intent(this, AdBlockVpnService.class).setAction(AdBlockVpnService.ACTION_STOP));
+        else {
             Intent permission = VpnService.prepare(this);
             if (permission != null) startActivityForResult(permission, VPN_REQUEST);
             else startProtection();
@@ -207,12 +226,10 @@ public class MainActivity extends Activity {
 
     private void startProtection() {
         Intent intent = new Intent(this, AdBlockVpnService.class).setAction(AdBlockVpnService.ACTION_START);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent);
-        else startService(intent);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent); else startService(intent);
     }
 
-    @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+    @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == VPN_REQUEST && resultCode == RESULT_OK) startProtection();
     }
@@ -225,23 +242,87 @@ public class MainActivity extends Activity {
         protectionButton.setText(running ? "Desactivar" : "Activar protección");
         blockedCountText.setText(String.valueOf(prefs.getLong("blocked_count", 0)));
         seenCountText.setText(String.valueOf(prefs.getLong("seen_count", 0)));
+        strictCountText.setText(String.valueOf(countLines(prefs.getString("strict_apps", ""))));
+    }
+
+    private int countLines(String raw) {
+        if (raw == null || raw.trim().isEmpty()) return 0;
+        int count = 0;
+        for (String line : raw.split("\\r?\\n")) if (!line.trim().isEmpty()) count++;
+        return count;
+    }
+
+    private void chooseStrictApps() {
+        chooseAppList("strict_apps", "Modo estricto por app", "En estas apps, los dominios que parezcan publicidad, tracking o analítica se bloquearán automáticamente sin pedir confirmación.");
+    }
+
+    private void chooseAppList(String key, String title, String explanation) {
+        Intent launcher = new Intent(Intent.ACTION_MAIN);
+        launcher.addCategory(Intent.CATEGORY_LAUNCHER);
+        List<ResolveInfo> infos = getPackageManager().queryIntentActivities(launcher, 0);
+        Map<String, String> labels = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        for (ResolveInfo info : infos) {
+            String pkg = info.activityInfo.packageName;
+            if (pkg.equals(getPackageName())) continue;
+            labels.put(pkg, String.valueOf(info.loadLabel(getPackageManager())));
+        }
+        Set<String> selected = new HashSet<>();
+        String saved = prefs.getString(key, "");
+        for (String line : saved.split("\\r?\\n")) if (!line.trim().isEmpty()) selected.add(line.trim());
+        List<String> packages = new ArrayList<>(labels.keySet());
+        CharSequence[] names = new CharSequence[packages.size()];
+        boolean[] checked = new boolean[packages.size()];
+        for (int i = 0; i < packages.size(); i++) {
+            names[i] = labels.get(packages.get(i));
+            checked[i] = selected.contains(packages.get(i));
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(title)
+                .setMessage(explanation)
+                .setMultiChoiceItems(names, checked, (dialog, which, isChecked) -> checked[which] = isChecked)
+                .setPositiveButton("Guardar", (dialog, which) -> {
+                    StringBuilder out = new StringBuilder();
+                    for (int i = 0; i < packages.size(); i++) if (checked[i]) out.append(packages.get(i)).append('\n');
+                    prefs.edit().putString(key, out.toString().trim()).apply();
+                    if ("excluded_apps".equals(key) && prefs.getBoolean("running", false)) {
+                        Toast.makeText(this, "Desactiva y vuelve a activar la protección para aplicar las exclusiones", Toast.LENGTH_LONG).show();
+                    } else if ("strict_apps".equals(key) && !hasUsageAccess()) {
+                        new AlertDialog.Builder(this)
+                                .setTitle("Falta Acceso de uso")
+                                .setMessage("La lista quedó guardada. Para que el modo estricto se active solo dentro de esas apps, habilita Add Blocker en Acceso de uso.")
+                                .setPositiveButton("Abrir ajustes", (d, w) -> openUsageAccess())
+                                .setNegativeButton("Después", null)
+                                .show();
+                    } else Toast.makeText(this, "Configuración guardada", Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("Cancelar", null)
+                .show();
+    }
+
+    private boolean hasUsageAccess() {
+        try {
+            AppOpsManager appOps = (AppOpsManager) getSystemService(Context.APP_OPS_SERVICE);
+            ApplicationInfo ai = getPackageManager().getApplicationInfo(getPackageName(), 0);
+            int mode = appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, ai.uid, ai.packageName);
+            return mode == AppOpsManager.MODE_ALLOWED;
+        } catch (Exception e) { return false; }
+    }
+
+    private void openUsageAccess() {
+        try { startActivity(new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)); }
+        catch (Exception e) { Toast.makeText(this, "No se pudieron abrir los ajustes de Acceso de uso", Toast.LENGTH_LONG).show(); }
     }
 
     private void startNewCapture() {
         new AlertDialog.Builder(this)
                 .setTitle("Nueva captura")
-                .setMessage("Se borrará el registro de dominios detectados. Después abre la app donde aparece el anuncio, intenta reproducirlo y vuelve a AddBlocker para revisar los dominios nuevos.")
+                .setMessage("Se borrará el registro actual. Después abre la app donde aparece el anuncio, intenta reproducirlo y vuelve a AddBlocker.")
                 .setPositiveButton("Empezar", (d, w) -> {
                     long generation = prefs.getLong("log_generation", 0) + 1;
-                    prefs.edit()
-                            .putString("dns_log", "")
-                            .putLong("seen_count", 0)
-                            .putLong("log_generation", generation)
-                            .apply();
+                    prefs.edit().putString("dns_log", "").putLong("seen_count", 0).putLong("log_generation", generation).apply();
                     Toast.makeText(this, "Captura iniciada. Ahora reproduce el anuncio.", Toast.LENGTH_LONG).show();
                 })
-                .setNegativeButton("Cancelar", null)
-                .show();
+                .setNegativeButton("Cancelar", null).show();
     }
 
     private void showDetectedDomains() {
@@ -250,49 +331,35 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "Todavía no hay dominios registrados", Toast.LENGTH_SHORT).show();
             return;
         }
-
-        java.util.List<String> domains = new java.util.ArrayList<>();
-        java.util.List<String> flags = new java.util.ArrayList<>();
-        java.util.List<String> labels = new java.util.ArrayList<>();
-        java.util.Set<String> unique = new java.util.HashSet<>();
-
+        List<String> domains = new ArrayList<>();
+        List<String> flags = new ArrayList<>();
+        List<String> labels = new ArrayList<>();
+        Set<String> unique = new HashSet<>();
         for (String line : raw.split("\\r?\\n")) {
             String[] parts = line.split("\\t", 3);
             if (parts.length != 3) continue;
             String flag = parts[1];
             String domain = parts[2].trim();
             if (domain.isEmpty() || !unique.add(domain)) continue;
-            domains.add(domain);
-            flags.add(flag);
-            String prefix;
-            if ("B".equals(flag)) prefix = "[BLOQUEADO] ";
-            else if ("S".equals(flag)) prefix = "[POSIBLE ANUNCIO] ";
-            else prefix = "[TRÁFICO] ";
+            domains.add(domain); flags.add(flag);
+            String prefix = "B".equals(flag) ? "[BLOQUEADO] " : ("S".equals(flag) ? "[POSIBLE ANUNCIO] " : "[TRÁFICO] ");
             labels.add(prefix + domain);
         }
-
-        if (domains.isEmpty()) {
-            Toast.makeText(this, "No hay entradas válidas en el registro", Toast.LENGTH_SHORT).show();
-            return;
-        }
-
-        CharSequence[] items = labels.toArray(new CharSequence[0]);
+        if (domains.isEmpty()) return;
         new AlertDialog.Builder(this)
                 .setTitle("Dominios detectados")
-                .setMessage("Toca cualquier dominio para añadirlo a la lista de bloqueo. 'Posible anuncio' es una detección heurística, no una garantía.")
-                .setItems(items, (dialog, which) -> addCustomBlock(domains.get(which)))
+                .setMessage("Toca un dominio para bloquearlo manualmente.")
+                .setItems(labels.toArray(new CharSequence[0]), (dialog, which) -> addCustomBlock(domains.get(which)))
                 .setPositiveButton("Bloquear sospechosos", (dialog, which) -> blockSuspicious(domains, flags))
                 .setNeutralButton("Limpiar registro", (dialog, which) -> {
                     long generation = prefs.getLong("log_generation", 0) + 1;
                     prefs.edit().putString("dns_log", "").putLong("seen_count", 0).putLong("log_generation", generation).apply();
-                    Toast.makeText(this, "Registro limpiado", Toast.LENGTH_SHORT).show();
                 })
-                .setNegativeButton("Cerrar", null)
-                .show();
+                .setNegativeButton("Cerrar", null).show();
     }
 
-    private void blockSuspicious(java.util.List<String> domains, java.util.List<String> flags) {
-        java.util.LinkedHashSet<String> rules = getCustomBlockRules();
+    private void blockSuspicious(List<String> domains, List<String> flags) {
+        LinkedHashSet<String> rules = getCustomBlockRules();
         int added = 0;
         for (int i = 0; i < domains.size(); i++) {
             if (!"S".equals(flags.get(i))) continue;
@@ -300,31 +367,29 @@ public class MainActivity extends Activity {
             if (!domain.isEmpty() && rules.add(domain)) added++;
         }
         saveCustomBlockRules(rules);
-        Toast.makeText(this, added > 0 ? (added + " dominios añadidos al bloqueo") : "No había nuevos sospechosos", Toast.LENGTH_LONG).show();
+        Toast.makeText(this, added > 0 ? (added + " dominios añadidos") : "No había nuevos sospechosos", Toast.LENGTH_LONG).show();
     }
 
     private void addCustomBlock(String domain) {
         String normalized = normalizeDomain(domain);
         if (normalized.isEmpty()) return;
-        java.util.LinkedHashSet<String> rules = getCustomBlockRules();
+        LinkedHashSet<String> rules = getCustomBlockRules();
         boolean added = rules.add(normalized);
         saveCustomBlockRules(rules);
         Toast.makeText(this, added ? (normalized + " bloqueado") : (normalized + " ya estaba bloqueado"), Toast.LENGTH_LONG).show();
     }
 
-    private java.util.LinkedHashSet<String> getCustomBlockRules() {
-        java.util.LinkedHashSet<String> rules = new java.util.LinkedHashSet<>();
+    private LinkedHashSet<String> getCustomBlockRules() {
+        LinkedHashSet<String> rules = new LinkedHashSet<>();
         String current = prefs.getString("custom_block", "");
-        if (current != null) {
-            for (String line : current.split("\\r?\\n")) {
-                String d = normalizeDomain(line);
-                if (!d.isEmpty()) rules.add(d);
-            }
+        if (current != null) for (String line : current.split("\\r?\\n")) {
+            String d = normalizeDomain(line);
+            if (!d.isEmpty()) rules.add(d);
         }
         return rules;
     }
 
-    private void saveCustomBlockRules(java.util.LinkedHashSet<String> rules) {
+    private void saveCustomBlockRules(LinkedHashSet<String> rules) {
         StringBuilder out = new StringBuilder();
         for (String rule : rules) {
             if (out.length() > 0) out.append('\n');
@@ -336,73 +401,21 @@ public class MainActivity extends Activity {
     private void editList(String key, String title, String hint) {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
-        int p = dp(16);
-        box.setPadding(p,p,p,p);
+        int p = dp(16); box.setPadding(p,p,p,p);
         TextView helper = text(hint, 13, Color.DKGRAY, false);
         EditText input = new EditText(this);
-        input.setMinLines(8);
-        input.setGravity(Gravity.TOP);
-        input.setText(prefs.getString(key, ""));
+        input.setMinLines(8); input.setGravity(Gravity.TOP); input.setText(prefs.getString(key, ""));
         box.addView(helper);
         box.addView(input, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(260)));
-
-        new AlertDialog.Builder(this)
-            .setTitle(title)
-            .setView(box)
-            .setPositiveButton("Guardar", (d, w) -> {
-                prefs.edit().putString(key, normalizeDomainList(input.getText().toString())).apply();
-                Toast.makeText(this, "Lista guardada", Toast.LENGTH_SHORT).show();
-            })
-            .setNegativeButton("Cancelar", null)
-            .show();
-    }
-
-    private void chooseExcludedApps() {
-        Intent launcher = new Intent(Intent.ACTION_MAIN);
-        launcher.addCategory(Intent.CATEGORY_LAUNCHER);
-        java.util.List<ResolveInfo> infos = getPackageManager().queryIntentActivities(launcher, 0);
-        java.util.Map<String, String> labels = new java.util.TreeMap<>(String.CASE_INSENSITIVE_ORDER);
-        for (ResolveInfo info : infos) {
-            String pkg = info.activityInfo.packageName;
-            if (pkg.equals(getPackageName())) continue;
-            String label = String.valueOf(info.loadLabel(getPackageManager()));
-            labels.put(pkg, label);
-        }
-
-        String saved = prefs.getString("excluded_apps", "");
-        java.util.Set<String> selected = new java.util.HashSet<>();
-        for (String line : saved.split("\\r?\\n")) if (!line.trim().isEmpty()) selected.add(line.trim());
-
-        java.util.List<String> packages = new java.util.ArrayList<>(labels.keySet());
-        CharSequence[] names = new CharSequence[packages.size()];
-        boolean[] checked = new boolean[packages.size()];
-        for (int i = 0; i < packages.size(); i++) {
-            names[i] = labels.get(packages.get(i));
-            checked[i] = selected.contains(packages.get(i));
-        }
-
-        new AlertDialog.Builder(this)
-            .setTitle("Apps excluidas")
-            .setMultiChoiceItems(names, checked, (dialog, which, isChecked) -> checked[which] = isChecked)
-            .setPositiveButton("Guardar", (dialog, which) -> {
-                StringBuilder out = new StringBuilder();
-                for (int i = 0; i < packages.size(); i++) if (checked[i]) out.append(packages.get(i)).append('\n');
-                prefs.edit().putString("excluded_apps", out.toString().trim()).apply();
-                if (prefs.getBoolean("running", false)) {
-                    Toast.makeText(this, "Desactiva y vuelve a activar la protección para aplicar el cambio", Toast.LENGTH_LONG).show();
-                } else {
-                    Toast.makeText(this, "Apps excluidas guardadas", Toast.LENGTH_SHORT).show();
-                }
-            })
-            .setNegativeButton("Cancelar", null)
-            .show();
+        new AlertDialog.Builder(this).setTitle(title).setView(box)
+                .setPositiveButton("Guardar", (d, w) -> prefs.edit().putString(key, normalizeDomainList(input.getText().toString())).apply())
+                .setNegativeButton("Cancelar", null).show();
     }
 
     private String normalizeDomain(String value) {
-        String d = value == null ? "" : value.trim().toLowerCase(java.util.Locale.US);
+        String d = value == null ? "" : value.trim().toLowerCase(Locale.US);
         d = d.replaceFirst("^https?://", "");
-        int slash = d.indexOf('/');
-        if (slash >= 0) d = d.substring(0, slash);
+        int slash = d.indexOf('/'); if (slash >= 0) d = d.substring(0, slash);
         if (d.startsWith("*.")) d = d.substring(2);
         return d;
     }
