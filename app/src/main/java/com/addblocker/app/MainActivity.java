@@ -32,6 +32,7 @@ public class MainActivity extends Activity {
     private Button protectionButton;
     private TextView statusText;
     private TextView blockedCountText;
+    private TextView seenCountText;
     private Switch bootSwitch;
     private final Handler handler = new Handler(Looper.getMainLooper());
 
@@ -104,9 +105,22 @@ public class MainActivity extends Activity {
         LinearLayout statsCard = card();
         TextView statsLabel = text("Consultas bloqueadas", 14, Color.rgb(176,176,176), false);
         blockedCountText = text("0", 34, Color.rgb(255,122,0), true);
+        TextView seenLabel = text("Dominios detectados en el registro", 14, Color.rgb(176,176,176), false);
+        seenLabel.setPadding(0, dp(12), 0, 0);
+        seenCountText = text("0", 24, Color.WHITE, true);
         statsCard.addView(statsLabel);
         statsCard.addView(blockedCountText);
+        statsCard.addView(seenLabel);
+        statsCard.addView(seenCountText);
         root.addView(statsCard, matchWrap(dp(14)));
+
+        Button detected = secondaryButton("Registro de anuncios detectados");
+        detected.setOnClickListener(v -> showDetectedDomains());
+        root.addView(detected, matchWrap(dp(10)));
+
+        Button newCapture = secondaryButton("Nueva captura de anuncios");
+        newCapture.setOnClickListener(v -> startNewCapture());
+        root.addView(newCapture, matchWrap(dp(10)));
 
         Button blockList = secondaryButton("Editar lista de bloqueo");
         blockList.setOnClickListener(v -> editList("custom_block", "Dominios bloqueados", "Un dominio por línea. Ejemplo:\nads.example.com"));
@@ -135,7 +149,7 @@ public class MainActivity extends Activity {
         });
         root.addView(vpnSettings, matchWrap(dp(16)));
 
-        TextView note = text("El filtrado se hace en el teléfono. No se envía todo tu tráfico a un servidor VPN externo. Algunos anuncios integrados en el mismo dominio del contenido pueden no bloquearse.", 13, Color.rgb(176,176,176), false);
+        TextView note = text("El filtrado se hace en el teléfono. El registro muestra consultas DNS recientes y marca como posibles anuncios los dominios que coinciden con patrones de redes publicitarias. La marca es orientativa: puedes revisar cada dominio antes de bloquearlo.", 13, Color.rgb(176,176,176), false);
         note.setLineSpacing(0, 1.2f);
         root.addView(note, matchWrap(dp(30)));
 
@@ -210,6 +224,113 @@ public class MainActivity extends Activity {
         statusText.setTextColor(running ? Color.rgb(255,122,0) : Color.WHITE);
         protectionButton.setText(running ? "Desactivar" : "Activar protección");
         blockedCountText.setText(String.valueOf(prefs.getLong("blocked_count", 0)));
+        seenCountText.setText(String.valueOf(prefs.getLong("seen_count", 0)));
+    }
+
+    private void startNewCapture() {
+        new AlertDialog.Builder(this)
+                .setTitle("Nueva captura")
+                .setMessage("Se borrará el registro de dominios detectados. Después abre la app donde aparece el anuncio, intenta reproducirlo y vuelve a AddBlocker para revisar los dominios nuevos.")
+                .setPositiveButton("Empezar", (d, w) -> {
+                    long generation = prefs.getLong("log_generation", 0) + 1;
+                    prefs.edit()
+                            .putString("dns_log", "")
+                            .putLong("seen_count", 0)
+                            .putLong("log_generation", generation)
+                            .apply();
+                    Toast.makeText(this, "Captura iniciada. Ahora reproduce el anuncio.", Toast.LENGTH_LONG).show();
+                })
+                .setNegativeButton("Cancelar", null)
+                .show();
+    }
+
+    private void showDetectedDomains() {
+        String raw = prefs.getString("dns_log", "");
+        if (raw == null || raw.trim().isEmpty()) {
+            Toast.makeText(this, "Todavía no hay dominios registrados", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        java.util.List<String> domains = new java.util.ArrayList<>();
+        java.util.List<String> flags = new java.util.ArrayList<>();
+        java.util.List<String> labels = new java.util.ArrayList<>();
+        java.util.Set<String> unique = new java.util.HashSet<>();
+
+        for (String line : raw.split("\\r?\\n")) {
+            String[] parts = line.split("\\t", 3);
+            if (parts.length != 3) continue;
+            String flag = parts[1];
+            String domain = parts[2].trim();
+            if (domain.isEmpty() || !unique.add(domain)) continue;
+            domains.add(domain);
+            flags.add(flag);
+            String prefix;
+            if ("B".equals(flag)) prefix = "[BLOQUEADO] ";
+            else if ("S".equals(flag)) prefix = "[POSIBLE ANUNCIO] ";
+            else prefix = "[TRÁFICO] ";
+            labels.add(prefix + domain);
+        }
+
+        if (domains.isEmpty()) {
+            Toast.makeText(this, "No hay entradas válidas en el registro", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        CharSequence[] items = labels.toArray(new CharSequence[0]);
+        new AlertDialog.Builder(this)
+                .setTitle("Dominios detectados")
+                .setMessage("Toca cualquier dominio para añadirlo a la lista de bloqueo. 'Posible anuncio' es una detección heurística, no una garantía.")
+                .setItems(items, (dialog, which) -> addCustomBlock(domains.get(which)))
+                .setPositiveButton("Bloquear sospechosos", (dialog, which) -> blockSuspicious(domains, flags))
+                .setNeutralButton("Limpiar registro", (dialog, which) -> {
+                    long generation = prefs.getLong("log_generation", 0) + 1;
+                    prefs.edit().putString("dns_log", "").putLong("seen_count", 0).putLong("log_generation", generation).apply();
+                    Toast.makeText(this, "Registro limpiado", Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("Cerrar", null)
+                .show();
+    }
+
+    private void blockSuspicious(java.util.List<String> domains, java.util.List<String> flags) {
+        java.util.LinkedHashSet<String> rules = getCustomBlockRules();
+        int added = 0;
+        for (int i = 0; i < domains.size(); i++) {
+            if (!"S".equals(flags.get(i))) continue;
+            String domain = normalizeDomain(domains.get(i));
+            if (!domain.isEmpty() && rules.add(domain)) added++;
+        }
+        saveCustomBlockRules(rules);
+        Toast.makeText(this, added > 0 ? (added + " dominios añadidos al bloqueo") : "No había nuevos sospechosos", Toast.LENGTH_LONG).show();
+    }
+
+    private void addCustomBlock(String domain) {
+        String normalized = normalizeDomain(domain);
+        if (normalized.isEmpty()) return;
+        java.util.LinkedHashSet<String> rules = getCustomBlockRules();
+        boolean added = rules.add(normalized);
+        saveCustomBlockRules(rules);
+        Toast.makeText(this, added ? (normalized + " bloqueado") : (normalized + " ya estaba bloqueado"), Toast.LENGTH_LONG).show();
+    }
+
+    private java.util.LinkedHashSet<String> getCustomBlockRules() {
+        java.util.LinkedHashSet<String> rules = new java.util.LinkedHashSet<>();
+        String current = prefs.getString("custom_block", "");
+        if (current != null) {
+            for (String line : current.split("\\r?\\n")) {
+                String d = normalizeDomain(line);
+                if (!d.isEmpty()) rules.add(d);
+            }
+        }
+        return rules;
+    }
+
+    private void saveCustomBlockRules(java.util.LinkedHashSet<String> rules) {
+        StringBuilder out = new StringBuilder();
+        for (String rule : rules) {
+            if (out.length() > 0) out.append('\n');
+            out.append(rule);
+        }
+        prefs.edit().putString("custom_block", out.toString()).apply();
     }
 
     private void editList(String key, String title, String hint) {
@@ -277,14 +398,19 @@ public class MainActivity extends Activity {
             .show();
     }
 
+    private String normalizeDomain(String value) {
+        String d = value == null ? "" : value.trim().toLowerCase(java.util.Locale.US);
+        d = d.replaceFirst("^https?://", "");
+        int slash = d.indexOf('/');
+        if (slash >= 0) d = d.substring(0, slash);
+        if (d.startsWith("*.")) d = d.substring(2);
+        return d;
+    }
+
     private String normalizeDomainList(String raw) {
         StringBuilder out = new StringBuilder();
         for (String line : raw.split("\\r?\\n")) {
-            String d = line.trim().toLowerCase();
-            d = d.replaceFirst("^https?://", "");
-            int slash = d.indexOf('/');
-            if (slash >= 0) d = d.substring(0, slash);
-            if (d.startsWith("*.")) d = d.substring(2);
+            String d = normalizeDomain(line);
             if (!d.isEmpty()) out.append(d).append('\n');
         }
         return out.toString().trim();
