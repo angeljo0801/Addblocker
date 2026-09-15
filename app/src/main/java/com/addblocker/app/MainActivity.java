@@ -34,9 +34,7 @@ import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.Set;
-import java.util.TreeMap;
 
 public class MainActivity extends Activity {
     private static final int VPN_REQUEST = 1001;
@@ -118,11 +116,13 @@ public class MainActivity extends Activity {
         statsCard.addView(text("Consultas bloqueadas", 14, Color.rgb(176,176,176), false));
         blockedCountText = text("0", 34, Color.rgb(255,122,0), true);
         statsCard.addView(blockedCountText);
+
         TextView seenLabel = text("Dominios detectados", 14, Color.rgb(176,176,176), false);
         seenLabel.setPadding(0, dp(12), 0, 0);
         statsCard.addView(seenLabel);
         seenCountText = text("0", 24, Color.WHITE, true);
         statsCard.addView(seenCountText);
+
         TextView strictLabel = text("Apps en modo estricto", 14, Color.rgb(176,176,176), false);
         strictLabel.setPadding(0, dp(12), 0, 0);
         statsCard.addView(strictLabel);
@@ -212,12 +212,15 @@ public class MainActivity extends Activity {
         return lp;
     }
 
-    private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }
+    private int dp(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
+    }
 
     private void toggleProtection() {
         boolean running = prefs.getBoolean("running", false);
-        if (running) startService(new Intent(this, AdBlockVpnService.class).setAction(AdBlockVpnService.ACTION_STOP));
-        else {
+        if (running) {
+            startService(new Intent(this, AdBlockVpnService.class).setAction(AdBlockVpnService.ACTION_STOP));
+        } else {
             Intent permission = VpnService.prepare(this);
             if (permission != null) startActivityForResult(permission, VPN_REQUEST);
             else startProtection();
@@ -226,7 +229,8 @@ public class MainActivity extends Activity {
 
     private void startProtection() {
         Intent intent = new Intent(this, AdBlockVpnService.class).setAction(AdBlockVpnService.ACTION_START);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent); else startService(intent);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent);
+        else startService(intent);
     }
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
@@ -253,47 +257,76 @@ public class MainActivity extends Activity {
     }
 
     private void chooseStrictApps() {
-        chooseAppList("strict_apps", "Modo estricto por app", "En estas apps, los dominios que parezcan publicidad, tracking o analítica se bloquearán automáticamente sin pedir confirmación.");
+        chooseAppList("strict_apps", "Modo estricto por app", "Marca las apps donde quieres que todo dominio sospechoso se bloquee automáticamente.");
     }
 
     private void chooseAppList(String key, String title, String explanation) {
         Intent launcher = new Intent(Intent.ACTION_MAIN);
         launcher.addCategory(Intent.CATEGORY_LAUNCHER);
-        List<ResolveInfo> infos = getPackageManager().queryIntentActivities(launcher, 0);
-        Map<String, String> labels = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        List<ResolveInfo> infos = getPackageManager().queryIntentActivities(launcher, PackageManager.MATCH_ALL);
+        infos.sort((a, b) -> String.valueOf(a.loadLabel(getPackageManager())).compareToIgnoreCase(String.valueOf(b.loadLabel(getPackageManager()))));
+
+        List<String> packages = new ArrayList<>();
+        List<String> labels = new ArrayList<>();
+        Set<String> seenPackages = new HashSet<>();
         for (ResolveInfo info : infos) {
             String pkg = info.activityInfo.packageName;
-            if (pkg.equals(getPackageName())) continue;
-            labels.put(pkg, String.valueOf(info.loadLabel(getPackageManager())));
+            if (pkg.equals(getPackageName()) || !seenPackages.add(pkg)) continue;
+            packages.add(pkg);
+            labels.add(String.valueOf(info.loadLabel(getPackageManager())));
         }
+
+        if (packages.isEmpty()) {
+            new AlertDialog.Builder(this)
+                    .setTitle(title)
+                    .setMessage("Android no devolvió ninguna aplicación para mostrar. Esta versión incluye la corrección de visibilidad; si acabas de actualizar, cierra y vuelve a abrir AddBlocker.")
+                    .setPositiveButton("Cerrar", null)
+                    .show();
+            return;
+        }
+
         Set<String> selected = new HashSet<>();
         String saved = prefs.getString(key, "");
-        for (String line : saved.split("\\r?\\n")) if (!line.trim().isEmpty()) selected.add(line.trim());
-        List<String> packages = new ArrayList<>(labels.keySet());
-        CharSequence[] names = new CharSequence[packages.size()];
-        boolean[] checked = new boolean[packages.size()];
-        for (int i = 0; i < packages.size(); i++) {
-            names[i] = labels.get(packages.get(i));
-            checked[i] = selected.contains(packages.get(i));
+        if (saved != null) {
+            for (String line : saved.split("\\r?\\n")) if (!line.trim().isEmpty()) selected.add(line.trim());
         }
+
+        CharSequence[] names = labels.toArray(new CharSequence[0]);
+        boolean[] checked = new boolean[packages.size()];
+        for (int i = 0; i < packages.size(); i++) checked[i] = selected.contains(packages.get(i));
+
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.VERTICAL);
+        header.setPadding(dp(24), dp(18), dp(24), dp(10));
+        TextView hTitle = text(title, 22, Color.WHITE, false);
+        TextView hInfo = text(explanation, 14, Color.LTGRAY, false);
+        hInfo.setPadding(0, dp(8), 0, 0);
+        header.addView(hTitle);
+        header.addView(hInfo);
+
         new AlertDialog.Builder(this)
-                .setTitle(title)
-                .setMessage(explanation)
+                .setCustomTitle(header)
                 .setMultiChoiceItems(names, checked, (dialog, which, isChecked) -> checked[which] = isChecked)
                 .setPositiveButton("Guardar", (dialog, which) -> {
                     StringBuilder out = new StringBuilder();
-                    for (int i = 0; i < packages.size(); i++) if (checked[i]) out.append(packages.get(i)).append('\n');
+                    for (int i = 0; i < packages.size(); i++) {
+                        if (checked[i]) out.append(packages.get(i)).append('\n');
+                    }
                     prefs.edit().putString(key, out.toString().trim()).apply();
+                    refreshUi();
+
                     if ("excluded_apps".equals(key) && prefs.getBoolean("running", false)) {
                         Toast.makeText(this, "Desactiva y vuelve a activar la protección para aplicar las exclusiones", Toast.LENGTH_LONG).show();
                     } else if ("strict_apps".equals(key) && !hasUsageAccess()) {
                         new AlertDialog.Builder(this)
                                 .setTitle("Falta Acceso de uso")
-                                .setMessage("La lista quedó guardada. Para que el modo estricto se active solo dentro de esas apps, habilita Add Blocker en Acceso de uso.")
+                                .setMessage("La lista quedó guardada. Para activar el modo estricto solo dentro de esas apps, habilita Add Blocker en Acceso de uso.")
                                 .setPositiveButton("Abrir ajustes", (d, w) -> openUsageAccess())
                                 .setNegativeButton("Después", null)
                                 .show();
-                    } else Toast.makeText(this, "Configuración guardada", Toast.LENGTH_SHORT).show();
+                    } else {
+                        Toast.makeText(this, "Configuración guardada", Toast.LENGTH_SHORT).show();
+                    }
                 })
                 .setNegativeButton("Cancelar", null)
                 .show();
@@ -305,7 +338,9 @@ public class MainActivity extends Activity {
             ApplicationInfo ai = getPackageManager().getApplicationInfo(getPackageName(), 0);
             int mode = appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, ai.uid, ai.packageName);
             return mode == AppOpsManager.MODE_ALLOWED;
-        } catch (Exception e) { return false; }
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private void openUsageAccess() {
@@ -322,7 +357,8 @@ public class MainActivity extends Activity {
                     prefs.edit().putString("dns_log", "").putLong("seen_count", 0).putLong("log_generation", generation).apply();
                     Toast.makeText(this, "Captura iniciada. Ahora reproduce el anuncio.", Toast.LENGTH_LONG).show();
                 })
-                .setNegativeButton("Cancelar", null).show();
+                .setNegativeButton("Cancelar", null)
+                .show();
     }
 
     private void showDetectedDomains() {
@@ -331,31 +367,39 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "Todavía no hay dominios registrados", Toast.LENGTH_SHORT).show();
             return;
         }
+
         List<String> domains = new ArrayList<>();
         List<String> flags = new ArrayList<>();
         List<String> labels = new ArrayList<>();
         Set<String> unique = new HashSet<>();
+
         for (String line : raw.split("\\r?\\n")) {
             String[] parts = line.split("\\t", 3);
             if (parts.length != 3) continue;
             String flag = parts[1];
             String domain = parts[2].trim();
             if (domain.isEmpty() || !unique.add(domain)) continue;
-            domains.add(domain); flags.add(flag);
+            domains.add(domain);
+            flags.add(flag);
             String prefix = "B".equals(flag) ? "[BLOQUEADO] " : ("S".equals(flag) ? "[POSIBLE ANUNCIO] " : "[TRÁFICO] ");
             labels.add(prefix + domain);
         }
-        if (domains.isEmpty()) return;
+
+        if (domains.isEmpty()) {
+            Toast.makeText(this, "No hay entradas válidas", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
         new AlertDialog.Builder(this)
                 .setTitle("Dominios detectados")
-                .setMessage("Toca un dominio para bloquearlo manualmente.")
                 .setItems(labels.toArray(new CharSequence[0]), (dialog, which) -> addCustomBlock(domains.get(which)))
                 .setPositiveButton("Bloquear sospechosos", (dialog, which) -> blockSuspicious(domains, flags))
                 .setNeutralButton("Limpiar registro", (dialog, which) -> {
                     long generation = prefs.getLong("log_generation", 0) + 1;
                     prefs.edit().putString("dns_log", "").putLong("seen_count", 0).putLong("log_generation", generation).apply();
                 })
-                .setNegativeButton("Cerrar", null).show();
+                .setNegativeButton("Cerrar", null)
+                .show();
     }
 
     private void blockSuspicious(List<String> domains, List<String> flags) {
@@ -382,9 +426,11 @@ public class MainActivity extends Activity {
     private LinkedHashSet<String> getCustomBlockRules() {
         LinkedHashSet<String> rules = new LinkedHashSet<>();
         String current = prefs.getString("custom_block", "");
-        if (current != null) for (String line : current.split("\\r?\\n")) {
-            String d = normalizeDomain(line);
-            if (!d.isEmpty()) rules.add(d);
+        if (current != null) {
+            for (String line : current.split("\\r?\\n")) {
+                String d = normalizeDomain(line);
+                if (!d.isEmpty()) rules.add(d);
+            }
         }
         return rules;
     }
@@ -401,21 +447,29 @@ public class MainActivity extends Activity {
     private void editList(String key, String title, String hint) {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
-        int p = dp(16); box.setPadding(p,p,p,p);
+        int p = dp(16);
+        box.setPadding(p, p, p, p);
         TextView helper = text(hint, 13, Color.DKGRAY, false);
         EditText input = new EditText(this);
-        input.setMinLines(8); input.setGravity(Gravity.TOP); input.setText(prefs.getString(key, ""));
+        input.setMinLines(8);
+        input.setGravity(Gravity.TOP);
+        input.setText(prefs.getString(key, ""));
         box.addView(helper);
         box.addView(input, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(260)));
-        new AlertDialog.Builder(this).setTitle(title).setView(box)
+
+        new AlertDialog.Builder(this)
+                .setTitle(title)
+                .setView(box)
                 .setPositiveButton("Guardar", (d, w) -> prefs.edit().putString(key, normalizeDomainList(input.getText().toString())).apply())
-                .setNegativeButton("Cancelar", null).show();
+                .setNegativeButton("Cancelar", null)
+                .show();
     }
 
     private String normalizeDomain(String value) {
         String d = value == null ? "" : value.trim().toLowerCase(Locale.US);
         d = d.replaceFirst("^https?://", "");
-        int slash = d.indexOf('/'); if (slash >= 0) d = d.substring(0, slash);
+        int slash = d.indexOf('/');
+        if (slash >= 0) d = d.substring(0, slash);
         if (d.startsWith("*.")) d = d.substring(2);
         return d;
     }
