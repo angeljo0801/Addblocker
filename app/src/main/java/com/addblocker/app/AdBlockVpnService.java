@@ -35,13 +35,14 @@ public class AdBlockVpnService extends VpnService {
     private static final int NOTIFICATION_ID = 701;
     private static final String LOCAL_DNS = "10.7.0.2";
     private static final String VPN_ADDR = "10.7.0.1";
-    private static final int MAX_LOG_LINES = 300;
+    private static final int MAX_LOG_LINES = 400;
 
     private ParcelFileDescriptor tun;
     private Thread worker;
     private volatile boolean alive;
     private SharedPreferences prefs;
     private volatile Set<String> builtInDomains = Collections.emptySet();
+    private volatile Set<String> strictDomains = Collections.emptySet();
     private final Set<String> loggedThisSession = Collections.synchronizedSet(new HashSet<>());
     private long logGeneration = -1;
     private volatile String cachedForegroundPackage = "";
@@ -50,7 +51,8 @@ public class AdBlockVpnService extends VpnService {
     @Override public void onCreate() {
         super.onCreate();
         prefs = getSharedPreferences("addblocker", MODE_PRIVATE);
-        builtInDomains = loadAssetDomains();
+        builtInDomains = loadAssetDomains("domains.txt");
+        strictDomains = loadAssetDomains("strict_domains.txt");
         logGeneration = prefs.getLong("log_generation", 0);
         createNotificationChannel();
     }
@@ -75,18 +77,21 @@ public class AdBlockVpnService extends VpnService {
                     .addDnsServer(LOCAL_DNS)
                     .addRoute(LOCAL_DNS, 32)
                     .setBlocking(true);
+
             String excluded = prefs.getString("excluded_apps", "");
             for (String pkg : excluded.split("\\r?\\n")) {
                 pkg = pkg.trim();
                 if (pkg.isEmpty()) continue;
                 try { builder.addDisallowedApplication(pkg); } catch (Exception ignored) {}
             }
+
             tun = builder.establish();
             if (tun == null) {
                 prefs.edit().putBoolean("running", false).apply();
                 stopSelf();
                 return;
             }
+
             alive = true;
             prefs.edit().putBoolean("running", true).apply();
             worker = new Thread(this::packetLoop, "AddBlocker-DNS");
@@ -134,57 +139,87 @@ public class AdBlockVpnService extends VpnService {
             String domain = parseQuestionName(packet, dnsOffset, dnsLen);
             if (domain == null || domain.isEmpty()) return null;
 
-            boolean suspicious = isSuspiciousDomain(domain);
-            boolean blocked = shouldBlock(domain, suspicious);
+            Set<String> allow = parsePrefsSet(prefs.getString("allow_list", ""));
+            Set<String> custom = parsePrefsSet(prefs.getString("custom_block", ""));
+            boolean allowed = matches(domain, allow);
+            boolean normalBlocked = !allowed && (matches(domain, builtInDomains) || matches(domain, custom));
+            boolean strictForeground = isStrictForegroundApp();
+            boolean suspicious = isSuspiciousDomain(domain) || matches(domain, strictDomains);
+            boolean strictExtraBlocked = !allowed && !normalBlocked && strictForeground && suspicious;
+            boolean blocked = normalBlocked || strictExtraBlocked;
+
             recordDomain(domain, blocked, suspicious);
 
             byte[] dnsResponse;
             if (blocked) {
                 dnsResponse = buildNxDomain(packet, dnsOffset, dnsLen);
-                long total = prefs.getLong("blocked_count", 0) + 1;
-                prefs.edit().putLong("blocked_count", total).apply();
+                SharedPreferences.Editor edit = prefs.edit();
+                edit.putLong("blocked_count", prefs.getLong("blocked_count", 0) + 1);
+                if (strictExtraBlocked) {
+                    edit.putLong("strict_blocked_count", prefs.getLong("strict_blocked_count", 0) + 1);
+                    rememberStrictBlockedDomain(domain);
+                }
+                edit.apply();
             } else {
                 byte[] query = new byte[dnsLen];
                 System.arraycopy(packet, dnsOffset, query, 0, dnsLen);
                 dnsResponse = resolveUpstream(query);
                 if (dnsResponse == null) return null;
             }
+
             return wrapUdpIpv4Response(packet, ipHeader, dnsResponse);
         } catch (Exception e) {
             return null;
         }
     }
 
-    private boolean shouldBlock(String domain, boolean suspicious) {
-        Set<String> allow = parsePrefsSet(prefs.getString("allow_list", ""));
-        if (matches(domain, allow)) return false;
-
-        if (matches(domain, builtInDomains)) return true;
-        Set<String> custom = parsePrefsSet(prefs.getString("custom_block", ""));
-        if (matches(domain, custom)) return true;
-
-        return suspicious && isStrictForegroundApp();
+    private void rememberStrictBlockedDomain(String domain) {
+        String old = prefs.getString("strict_blocked_domains", "");
+        Set<String> existing = parsePrefsSet(old);
+        if (existing.contains(domain)) return;
+        String next = old == null || old.trim().isEmpty() ? domain : domain + "\n" + old;
+        String[] lines = next.split("\\r?\\n");
+        StringBuilder out = new StringBuilder();
+        for (int i = 0; i < Math.min(lines.length, 150); i++) {
+            if (i > 0) out.append('\n');
+            out.append(lines[i]);
+        }
+        prefs.edit().putString("strict_blocked_domains", out.toString()).apply();
     }
 
     private boolean isStrictForegroundApp() {
         String strictRaw = prefs.getString("strict_apps", "");
-        if (strictRaw == null || strictRaw.trim().isEmpty()) return false;
-        String foreground = getForegroundPackage();
-        if (foreground.isEmpty()) return false;
-        for (String pkg : strictRaw.split("\\r?\\n")) {
-            if (foreground.equals(pkg.trim())) return true;
+        if (strictRaw == null || strictRaw.trim().isEmpty()) {
+            prefs.edit().putBoolean("strict_mode_active", false).apply();
+            return false;
         }
-        return false;
+
+        String foreground = getForegroundPackage();
+        boolean active = false;
+        if (!foreground.isEmpty()) {
+            for (String pkg : strictRaw.split("\\r?\\n")) {
+                if (foreground.equals(pkg.trim())) {
+                    active = true;
+                    break;
+                }
+            }
+        }
+
+        prefs.edit()
+                .putString("last_foreground_package", foreground)
+                .putBoolean("strict_mode_active", active)
+                .apply();
+        return active;
     }
 
     private String getForegroundPackage() {
         long now = System.currentTimeMillis();
-        if (now - foregroundCacheTime < 750) return cachedForegroundPackage;
+        if (now - foregroundCacheTime < 500) return cachedForegroundPackage;
         foregroundCacheTime = now;
         try {
             UsageStatsManager manager = (UsageStatsManager) getSystemService(Context.USAGE_STATS_SERVICE);
             if (manager == null) return cachedForegroundPackage;
-            UsageEvents events = manager.queryEvents(now - 15000, now);
+            UsageEvents events = manager.queryEvents(now - 30000, now);
             UsageEvents.Event event = new UsageEvents.Event();
             String latest = "";
             long latestTime = 0;
@@ -209,6 +244,7 @@ public class AdBlockVpnService extends VpnService {
             logGeneration = currentGeneration;
         }
         if (!loggedThisSession.add(domain)) return;
+
         String flag = blocked ? "B" : (suspicious ? "S" : "N");
         String line = System.currentTimeMillis() + "\t" + flag + "\t" + domain;
         String old = prefs.getString("dns_log", "");
@@ -220,20 +256,30 @@ public class AdBlockVpnService extends VpnService {
             if (i > 0) trimmed.append('\n');
             trimmed.append(lines[i]);
         }
-        long seen = prefs.getLong("seen_count", 0) + 1;
-        prefs.edit().putString("dns_log", trimmed.toString()).putLong("seen_count", seen).apply();
+        prefs.edit()
+                .putString("dns_log", trimmed.toString())
+                .putLong("seen_count", prefs.getLong("seen_count", 0) + 1)
+                .apply();
     }
 
     private boolean isSuspiciousDomain(String domain) {
         String d = domain.toLowerCase(Locale.US);
         String[] tokens = {
                 "doubleclick", "googlesyndication", "googleadservices", "adservice", "admob",
-                "applovin", "unityads", "unity3dads", "ironsource", "is.com", "chartboost",
-                "vungle", "inmobi", "adcolony", "tapjoy", "fyber", "mopub", "pubmatic",
-                "rubiconproject", "amazon-adsystem", "adsystem", "adnxs", "criteo",
-                "scorecardresearch", "tracking", "tracker", "telemetry", "analytics", "metric",
+                "pagead", "pubads", "googleads", "imasdk", "googlevideo",
+                "applovin", "applvn", "unityads", "unity3dads", "ironsource", "supersonicads",
+                "chartboost", "vungle", "inmobi", "adcolony", "tapjoy", "fyber", "inner-active",
+                "mopub", "pubmatic", "rubiconproject", "amazon-adsystem", "adsystem", "adnxs",
+                "criteo", "scorecardresearch", "tracking", "tracker", "telemetry", "analytics",
                 "adjust.com", "appsflyer", "branch.io", "kochava", "singular.net", "airbridge",
-                "ads.", ".ads.", "-ads.", ".ad.", "adserver", "sponsor", "promotion"
+                "mbridge", "mbrsdk", "mtgglobals", "mintegral", "pangle", "pangolin",
+                "isnssdk", "pglstatp", "moloco", "bidmachine", "mobilefuse", "ogury", "hyprmx",
+                "startapp", "adjoe", "liftoff", "smaato", "freewheel", "spotx", "innovid",
+                "smartadserver", "yieldmo", "teads", "outbrain", "taboola", "revcontent", "mgid",
+                "vast", "vpaid", "rewarded", "interstitial", "mediation", "monetiz", "adserver",
+                "adrequest", "adunit", "impression", "clicktrack", "auction", "bidder", "bidding",
+                ".rtb.", "-rtb.", ".ssp.", "-ssp.", ".dsp.", "-dsp.",
+                "ads.", ".ads.", "-ads.", ".ad.", "sponsor", "promotion"
         };
         for (String token : tokens) if (d.contains(token)) return true;
         return d.startsWith("ad.") || d.startsWith("ads.") || d.startsWith("adserver.");
@@ -262,8 +308,11 @@ public class AdBlockVpnService extends VpnService {
     }
 
     private boolean matches(String domain, Set<String> list) {
+        if (list == null || list.isEmpty()) return false;
         String d = domain.toLowerCase(Locale.US);
-        for (String rule : list) if (d.equals(rule) || d.endsWith("." + rule)) return true;
+        for (String rule : list) {
+            if (d.equals(rule) || d.endsWith("." + rule)) return true;
+        }
         return false;
     }
 
@@ -277,9 +326,9 @@ public class AdBlockVpnService extends VpnService {
         return set;
     }
 
-    private Set<String> loadAssetDomains() {
+    private Set<String> loadAssetDomains(String assetName) {
         Set<String> set = new HashSet<>();
-        try (BufferedReader br = new BufferedReader(new InputStreamReader(getAssets().open("domains.txt")))) {
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(getAssets().open(assetName)))) {
             String line;
             while ((line = br.readLine()) != null) {
                 line = line.trim();
@@ -402,7 +451,8 @@ public class AdBlockVpnService extends VpnService {
 
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "Protección Add Blocker", NotificationManager.IMPORTANCE_LOW);
+            NotificationChannel channel = new NotificationChannel(
+                    CHANNEL_ID, "Protección Add Blocker", NotificationManager.IMPORTANCE_LOW);
             channel.setDescription("Mantiene activo el filtro DNS local");
             getSystemService(NotificationManager.class).createNotificationChannel(channel);
         }
@@ -410,11 +460,14 @@ public class AdBlockVpnService extends VpnService {
 
     private Notification buildNotification() {
         Intent open = new Intent(this, MainActivity.class);
-        PendingIntent pi = PendingIntent.getActivity(this, 0, open, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
-        Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? new Notification.Builder(this, CHANNEL_ID) : new Notification.Builder(this);
+        PendingIntent pi = PendingIntent.getActivity(
+                this, 0, open, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+        Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? new Notification.Builder(this, CHANNEL_ID)
+                : new Notification.Builder(this);
         return builder
                 .setContentTitle("Add Blocker activo")
-                .setContentText("Bloqueando anuncios; modo estricto disponible por app")
+                .setContentText("Bloqueo normal + modo estricto automático por app")
                 .setSmallIcon(android.R.drawable.ic_lock_lock)
                 .setContentIntent(pi)
                 .setOngoing(true)
@@ -423,19 +476,31 @@ public class AdBlockVpnService extends VpnService {
 
     private synchronized void stopVpn() {
         alive = false;
-        prefs.edit().putBoolean("running", false).apply();
-        if (worker != null) { worker.interrupt(); worker = null; }
-        if (tun != null) { try { tun.close(); } catch (Exception ignored) {} tun = null; }
+        prefs.edit().putBoolean("running", false).putBoolean("strict_mode_active", false).apply();
+        if (worker != null) {
+            worker.interrupt();
+            worker = null;
+        }
+        if (tun != null) {
+            try { tun.close(); } catch (Exception ignored) {}
+            tun = null;
+        }
         stopForeground(STOP_FOREGROUND_REMOVE);
         stopSelf();
     }
 
-    @Override public void onRevoke() { stopVpn(); super.onRevoke(); }
+    @Override public void onRevoke() {
+        stopVpn();
+        super.onRevoke();
+    }
 
     @Override public void onDestroy() {
         alive = false;
-        prefs.edit().putBoolean("running", false).apply();
-        if (tun != null) { try { tun.close(); } catch (Exception ignored) {} tun = null; }
+        prefs.edit().putBoolean("running", false).putBoolean("strict_mode_active", false).apply();
+        if (tun != null) {
+            try { tun.close(); } catch (Exception ignored) {}
+            tun = null;
+        }
         super.onDestroy();
     }
 }
